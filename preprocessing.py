@@ -6,7 +6,7 @@ from yastn.yastn.tensor._auxliary import _clear_axes, _struct
 from yastn.yastn.tensor._tests import _test_axes_match
 from yastn.yastn.tensor._merging import _mask_tensors_leg_intersection
 from yastn.yastn.tensor._contractions import _apply_mask_axes
-from yastn.yastn.tensor._contractions import _common_inds, einsum
+from yastn.yastn.tensor._contractions import _common_inds, ncon, einsum
 
 import numpy as np
 from collections import namedtuple
@@ -251,6 +251,73 @@ def build_sizes_dict(subscripts, *operands):
                 assert sizes_dict[c] == shape[j], f"{sizes_dict[c]}, {shape[j]}"
     return sizes_dict
 
+def convert_path_to_ncon(subscripts, path):
+    """
+    Convert an opt_einsum contraction path to ncon format.
+
+    Args:
+        subscripts (str): einsum string.
+        path: list of tuples, e.g., [(1, 2), (0, 1)]
+
+    Returns:
+        connects (list): list of lists of ints, one per initial tensor, for ncon
+        output_labels (list): list of ints (negative) for output indices
+        order (list): list of ints, positive labels in contraction order for ncon
+    """
+    # Parse subscripts
+    if '->' in subscripts:
+        left, right = subscripts.split('->')
+        implicit = False
+    else:
+        left = subscripts
+        right = None
+        implicit = True
+
+    terms = left.split(',')
+    # Build initial connects: list of lists of labels (strings)
+    connects = [list(term) for term in terms]
+
+    # Determine output labels if implicit
+    if implicit:
+        # Count occurrences of each label across all inputs
+        from collections import Counter
+        cnt = Counter(lbl for term in connects for lbl in term)
+        # Labels with count == 1
+        outs = [lbl for lbl, c in cnt.items() if c == 1]
+        # Sort alphabetically for numpy/opt_einsum default
+        right = ''.join(sorted(outs))
+
+    # Map each label to an integer
+    unique_labels = sorted({lbl for term in connects for lbl in term})
+    label_to_int = {lbl: i+1 for i, lbl in enumerate(unique_labels)}
+    # Determine output labels as negative integers
+    for i, lbl in enumerate(right, start=1):
+        label_to_int[lbl] = -i
+    output_labels = [label_to_int[lbl] for lbl in list(right)]
+
+    # Prepare current connects as lists of ints for simulating contractions
+    current = [[label_to_int[lbl] for lbl in term] for term in connects]
+    order = []
+
+    # Simulate contractions according to the path
+    for (i, j) in path:
+        # Identify labels common to both tensors at positions i and j in current list
+        labels_i = set(current[i])
+        labels_j = set(current[j])
+        common = sorted(labels_i & labels_j)
+        # Append these positive labels (if not already) in the contraction order
+        for lbl in common:
+            if lbl not in order:
+                order.append(lbl)
+        # Form new tensor connects: union minus the contracted labels
+        new_connect = sorted((labels_i | labels_j) - set(common))
+        # Remove the two tensors and append the resulting new tensor
+        for idx in sorted([i, j], reverse=True):
+            current.pop(idx)
+        current.append(new_connect)
+    # Return the initial connects mapping, output labels, and contraction order
+    return [[label_to_int[lbl] for lbl in term] for term in connects], output_labels, order
+
 
 if __name__ == "__main__":
     config_U1 = yastn.make_config(sym='U1', backend=backend)
@@ -274,11 +341,13 @@ if __name__ == "__main__":
     sizes_dict = build_sizes_dict(einsum_string, *reduced_ts)
     views = oe.helpers.build_views(einsum_string, sizes_dict)
     path, path_info = oe.contract_path(einsum_string, *views)
-    print("ts:", ts)
-    print("reduced_ts:", reduced_ts)
+    # print("ts:", ts)
+    # print("reduced_ts:", reduced_ts)
     print(sizes_dict)
-    # print(path)
     print(path_info)
+    input, output, order = convert_path_to_ncon(einsum_string, path)
+    res = ncon(ts, input, order=order)
+    assert yastn.allclose(einsum(einsum_string, *ts), res)
 
 
     # test_case 2
@@ -304,11 +373,13 @@ if __name__ == "__main__":
     sizes_dict = build_sizes_dict(einsum_string, *reduced_ts)
     views = oe.helpers.build_views(einsum_string, sizes_dict)
     path, path_info = oe.contract_path(einsum_string, *views)
-    print("ts:", ts)
-    print("reduced_ts:", reduced_ts)
+    # print("ts:", ts)
+    # print("reduced_ts:", reduced_ts)
     print(sizes_dict)
-    # print(path)
     print(path_info)
+    input, output, order = convert_path_to_ncon(einsum_string, path)
+    res = ncon(ts, input, order=order)
+    assert yastn.allclose(einsum(einsum_string, *ts), res)
 
     # test_case 3
     print("============================Test-Case-3==========================")
@@ -319,8 +390,10 @@ if __name__ == "__main__":
     sizes_dict = build_sizes_dict(einsum_string, *reduced_ts)
     views = oe.helpers.build_views(einsum_string, sizes_dict)
     path, path_info = oe.contract_path(einsum_string, *views)
-    print("ts:", ts)
-    print("reduced_ts:", reduced_ts)
+    # print("ts:", ts)
+    # print("reduced_ts:", reduced_ts)
     print(sizes_dict)
-    # print(path)
     print(path_info)
+    input, output, order = convert_path_to_ncon(einsum_string, path)
+    res = ncon(ts, input, order=order)
+    assert yastn.allclose(einsum(einsum_string, *ts), res)
