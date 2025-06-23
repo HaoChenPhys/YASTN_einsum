@@ -9,7 +9,7 @@ from yastn.yastn.tensor._contractions import _apply_mask_axes
 from yastn.yastn.tensor._contractions import _common_inds, ncon, einsum
 
 import numpy as np
-from collections import namedtuple
+from collections import namedtuple, Counter
 from copy import deepcopy
 import opt_einsum as oe
 
@@ -32,16 +32,18 @@ class Contract_Graph:
         return "\n".join(f"{u}: {self.adj[u]}" for u in range(self.n))
 
 
-def _contracted_edges(subscripts):
+def contracted_edges(subscripts, sliced=None):
     r"""
     Identify the contractions from einsum string.
 
     Args:
         subscripts (str): einsum string.
+        sliced (str): indices to be sliced.
 
     Returns:
         contracted_egdes (list): list of edges representing the contractions.
         Each edge is a pair of nodes representing the pair-wise contracted tensors.
+        sliced_edges (list): list of edges to be sliced, including the open ones.
     """
     if not isinstance(subscripts, str):
         raise YastnError('The first argument should be a string.')
@@ -75,25 +77,34 @@ def _contracted_edges(subscripts):
         if sin.count(idx) == 2 and idx not in sout
     }
 
+    sliced = set(sliced) if sliced else set()
     unpaired = {}
     contracted_edges = []
+    sliced_edges = []
+
     for i, term in enumerate(sin.split(',')):
         for ind, s in enumerate(term):
+            # collect sliced open axes
+            if s in sout and s in sliced:
+                sliced_edges.append((Node(i, ind),)) # connects to one node only
+
+            # collect contracted edges
             if s in contracted:
                 if s in unpaired:
                     contracted_edges.append((unpaired[s], Node(i, ind)))
+                    if s in sliced: sliced_edges.append(contracted_edges[-1])
                     unpaired.pop(s)
                 else:
                     unpaired[s] = Node(i, ind)
 
-    return contracted_edges
+    return contracted_edges, sliced_edges
 
 def _filter_blocks(tensor_list, pos_a, pos_b, axes):
     r"""
     Identify the indices of the blocks used in the actual contraction between tensor A and B.
 
     Args:
-        tensor_list (list): list of tensors.
+        tensor_list (list): list of YASTN tensors.
         pos_a (int): position of tensor A.
         pos_B (int): position of tensor B.
         axes (Sequence[Sequence[int], Sequence[int]]): contracted axes of A and B.
@@ -128,14 +139,15 @@ def reduced_tensor(t, block_inds):
     Construct the reduced tensor, given the indices of restricted blocks.
 
     Args:
-        t (list): list of tensors.
-        pos_a (int): position of tensor A.
-        pos_B (int): position of tensor B.
-        axes (Sequence[Sequence[int], Sequence[int]]): contracted axes of A and B.
+        t (YASTN tensor)
+        block_inds (list): indices of the restricted blocks.
 
     Returns:
-        ind_a, ind_b (tuple[int, int]): indices of the blocks in A and B, respectively.
+        new_t (YASTN tensor)
     """
+
+    if len(block_inds) == 0:
+        raise YastnError("No blocks matched the requested charge sector(s).")
 
     # Build new struct and slices referencing the same data
     new_t = tuple(t.struct.t[i] for i in block_inds)
@@ -172,21 +184,21 @@ def reduced_tensor(t, block_inds):
 
 def preprocess_contracted_dims(subscripts, *operands):
     r"""
-    Simplify tensors by dropping unused blocks in the contraction.
+    Simplify YASTN tensors by dropping unused blocks in the contraction.
 
     Args:
         subscripts (str): einsum string.
-        operands: tensors.
+        operands: YASTN tensors.
 
     Returns:
         G (Contract_Graph): graph representing the contraction.
-        reduced_operands (tuple): simplified tensors.
+        reduced_operands (tuple): simplified YASTN tensors.
     """
-    edges = _contracted_edges(subscripts)
-    G = Contract_Graph(num_nodes=len(operands), directed=False)
+    edges, _ = contracted_edges(subscripts)
     operands_list = list(operands)
 
     def iter_edges(edges):
+        G = Contract_Graph(num_nodes=len(operands), directed=False)
         t_blocks = {}
         for edge in edges:
             node1, node2 = edge
@@ -209,12 +221,13 @@ def preprocess_contracted_dims(subscripts, *operands):
             # Modify meta data to get reduced tensors,
             # whose final contraction result is the same as that of the original tensors.
             operands_list[pos] = reduced_tensor(operands_list[pos], ind)
+        return G
 
     prev_structs = [_struct()]*len(operands_list)
 
     converged = False
     while not converged:
-        iter_edges(edges)
+        G = iter_edges(edges)
         converged = True
         for i in range(len(operands_list)):
             if operands_list[i].struct != prev_structs[i]:
@@ -231,7 +244,7 @@ def build_sizes_dict(subscripts, *operands):
 
     Args:
         subscripts (str): einsum string.
-        operands: tensors.
+        operands: YASTN tensors.
 
     Returns:
         sizes_dict (dict): {symbol: size}
@@ -261,7 +274,6 @@ def convert_path_to_ncon(subscripts, path):
 
     Returns:
         connects (list): list of lists of ints, one per initial tensor, for ncon
-        output_labels (list): list of ints (negative) for output indices
         order (list): list of ints, positive labels in contraction order for ncon
     """
     # Parse subscripts
@@ -280,7 +292,6 @@ def convert_path_to_ncon(subscripts, path):
     # Determine output labels if implicit
     if implicit:
         # Count occurrences of each label across all inputs
-        from collections import Counter
         cnt = Counter(lbl for term in connects for lbl in term)
         # Labels with count == 1
         outs = [lbl for lbl, c in cnt.items() if c == 1]
@@ -293,11 +304,18 @@ def convert_path_to_ncon(subscripts, path):
     # Determine output labels as negative integers
     for i, lbl in enumerate(right, start=1):
         label_to_int[lbl] = -i
-    output_labels = [label_to_int[lbl] for lbl in list(right)]
 
     # Prepare current connects as lists of ints for simulating contractions
     current = [[label_to_int[lbl] for lbl in term] for term in connects]
     order = []
+
+    # First perform all traces
+    for term in connects:
+        cnt = Counter(term)
+        # For each label appearing more than once → self-contraction (trace)
+        for lbl, c in cnt.items():
+            if c > 1 and lbl not in order:
+                order.append(label_to_int[lbl])
 
     # Simulate contractions according to the path
     for (i, j) in path:
@@ -316,7 +334,7 @@ def convert_path_to_ncon(subscripts, path):
             current.pop(idx)
         current.append(new_connect)
     # Return the initial connects mapping, output labels, and contraction order
-    return [[label_to_int[lbl] for lbl in term] for term in connects], output_labels, order
+    return [[label_to_int[lbl] for lbl in term] for term in connects], order
 
 
 if __name__ == "__main__":
@@ -345,7 +363,7 @@ if __name__ == "__main__":
     # print("reduced_ts:", reduced_ts)
     print(sizes_dict)
     print(path_info)
-    input, output, order = convert_path_to_ncon(einsum_string, path)
+    input, order = convert_path_to_ncon(einsum_string, path)
     res = ncon(ts, input, order=order)
     assert yastn.allclose(einsum(einsum_string, *ts), res)
 
@@ -367,7 +385,7 @@ if __name__ == "__main__":
 
 
     ts = (a, b, c)
-    einsum_string = "ab,bc,cd->ad"
+    einsum_string = "ab,bc,cd->da"
     G, reduced_ts = preprocess_contracted_dims(einsum_string, *ts)
 
     sizes_dict = build_sizes_dict(einsum_string, *reduced_ts)
@@ -377,7 +395,7 @@ if __name__ == "__main__":
     # print("reduced_ts:", reduced_ts)
     print(sizes_dict)
     print(path_info)
-    input, output, order = convert_path_to_ncon(einsum_string, path)
+    input, order = convert_path_to_ncon(einsum_string, path)
     res = ncon(ts, input, order=order)
     assert yastn.allclose(einsum(einsum_string, *ts), res)
 
@@ -394,6 +412,6 @@ if __name__ == "__main__":
     # print("reduced_ts:", reduced_ts)
     print(sizes_dict)
     print(path_info)
-    input, output, order = convert_path_to_ncon(einsum_string, path)
+    input, order = convert_path_to_ncon(einsum_string, path)
     res = ncon(ts, input, order=order)
     assert yastn.allclose(einsum(einsum_string, *ts), res)
