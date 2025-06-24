@@ -264,6 +264,30 @@ def build_sizes_dict(subscripts, *operands):
                 assert sizes_dict[c] == shape[j], f"{sizes_dict[c]}, {shape[j]}"
     return sizes_dict
 
+def build_tensor_shapes(subscripts, *operands):
+    r"""
+    Compute the effective shapes of YASTN tensors in operands.
+    We simply add up dimensions for all symmetry sectors.
+
+    Args:
+        subscripts (str): einsum string.
+        operands: YASTN tensors.
+
+    Returns:
+        List of shapes matching the order of operands.
+    """
+    shapes = []
+
+    subscripts = subscripts.replace(' ', '')
+    tmp = subscripts.split('->')
+    sin = tmp[0]
+
+    for i, term in enumerate(sin.split(",")):
+        shape = operands[i].get_shape()
+        shapes.append(shape)
+    return shapes
+
+
 def convert_path_to_ncon(subscripts, path):
     """
     Convert an opt_einsum contraction path to ncon format.
@@ -356,12 +380,10 @@ if __name__ == "__main__":
     einsum_string = "ab,bc,cd,de->ae"
     G, reduced_ts = preprocess_contracted_dims(einsum_string, *ts)
 
-    sizes_dict = build_sizes_dict(einsum_string, *reduced_ts)
-    views = oe.helpers.build_views(einsum_string, sizes_dict)
-    path, path_info = oe.contract_path(einsum_string, *views)
-    # print("ts:", ts)
-    # print("reduced_ts:", reduced_ts)
-    print(sizes_dict)
+    # sizes_dict = build_sizes_dict(einsum_string, *reduced_ts)
+    # views = oe.helpers.build_views(einsum_string, sizes_dict)
+    t_shapes = build_tensor_shapes(einsum_string, *reduced_ts)
+    path, path_info = oe.contract_path(einsum_string, *t_shapes, shapes=True)
     print(path_info)
     input, order = convert_path_to_ncon(einsum_string, path)
     res = ncon(ts, input, order=order)
@@ -388,12 +410,8 @@ if __name__ == "__main__":
     einsum_string = "ab,bc,cd->da"
     G, reduced_ts = preprocess_contracted_dims(einsum_string, *ts)
 
-    sizes_dict = build_sizes_dict(einsum_string, *reduced_ts)
-    views = oe.helpers.build_views(einsum_string, sizes_dict)
-    path, path_info = oe.contract_path(einsum_string, *views)
-    # print("ts:", ts)
-    # print("reduced_ts:", reduced_ts)
-    print(sizes_dict)
+    t_shapes = build_tensor_shapes(einsum_string, *reduced_ts)
+    path, path_info = oe.contract_path(einsum_string, *t_shapes, shapes=True)
     print(path_info)
     input, order = convert_path_to_ncon(einsum_string, path)
     res = ncon(ts, input, order=order)
@@ -405,12 +423,9 @@ if __name__ == "__main__":
     einsum_string = "ab,bc,ca"
     G, reduced_ts = preprocess_contracted_dims(einsum_string, *ts)
 
-    sizes_dict = build_sizes_dict(einsum_string, *reduced_ts)
-    views = oe.helpers.build_views(einsum_string, sizes_dict)
-    path, path_info = oe.contract_path(einsum_string, *views)
-    # print("ts:", ts)
-    # print("reduced_ts:", reduced_ts)
-    print(sizes_dict)
+    t_shapes = build_tensor_shapes(einsum_string, *reduced_ts)
+    path, path_info = oe.contract_path(einsum_string, *t_shapes, shapes=True)
+    print(path_info)
     print(path_info)
     input, order = convert_path_to_ncon(einsum_string, path)
     res = ncon(ts, input, order=order)

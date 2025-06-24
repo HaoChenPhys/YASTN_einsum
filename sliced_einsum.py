@@ -6,10 +6,10 @@ from yastn.yastn.tensor._contractions import ncon, einsum
 from preprocessing import *
 
 import numpy as np
+import torch
 from torch.utils.checkpoint import checkpoint
 from collections import defaultdict
 from itertools import product
-
 
 
 def _restrict_charges(tensor, axes, t):
@@ -77,7 +77,14 @@ def _restrict_charges(tensor, axes, t):
         **new_kwargs
     )
 
-def sliced_einsum(subscripts, *operands, sliced=None, checkpoint=False):
+def _compress_ts(*operands):
+    data_t, meta_t= tuple(zip( *(t.compress_to_1d() for t in operands) ))
+    return data_t, meta_t
+
+def _decompress_ts(data_t, meta_t):
+    return tuple(decompress_from_1d(data, meta_t[i]) for i, data in enumerate(data_t))
+
+def sliced_einsum(subscripts, *operands, sliced=None, checkpoint_move=False, verbose=0):
     r"""
     Perform einsum with optional slicing and checkpointing.
 
@@ -90,7 +97,7 @@ def sliced_einsum(subscripts, *operands, sliced=None, checkpoint=False):
     Returns:
         res (YASTN tensor): contraction result.
     """
-    G, reduced_ts = preprocess_contracted_dims(einsum_string, *operands)
+    G, reduced_ts = preprocess_contracted_dims(subscripts, *operands)
     _, sliced_edges = contracted_edges(subscripts, sliced=sliced)
 
     sliced_charge_list = []
@@ -98,7 +105,12 @@ def sliced_einsum(subscripts, *operands, sliced=None, checkpoint=False):
         node = edge[0]
         sliced_charge_list.append(operands[node[0]].get_legs(axes=node[1]).tD.keys())
 
-    res = None
+    tot = None
+    def _loop_body(meta_t, input, order, *data_t):
+        tmp_ts = _decompress_ts(data_t, meta_t)
+        res = ncon(tmp_ts, input, order=order)
+        res_data, res_meta = res.compress_to_1d()
+        return res_data, res_meta
     for charge_choice in product(*sliced_charge_list):
         try:
             # slice contracted legs
@@ -111,66 +123,84 @@ def sliced_einsum(subscripts, *operands, sliced=None, checkpoint=False):
                 else: # len(edge) == 1 open leg
                     node = edge[0]
                     sliced_ts[node[0]] = _restrict_charges(sliced_ts[node[0]], axes=node[1], t=charge)
-            _, reduced_tmp = preprocess_contracted_dims(einsum_string, *sliced_ts)
 
-            sizes_dict = build_sizes_dict(subscripts, *reduced_tmp)
-            views = oe.helpers.build_views(subscripts, sizes_dict)
-            path, path_info = oe.contract_path(subscripts, *views)
-            print(sizes_dict)
-            print(path_info)
+            _, reduced_tmp = preprocess_contracted_dims(subscripts, *sliced_ts)
+            t_shapes = build_tensor_shapes(subscripts, *reduced_ts)
+            path, path_info = oe.contract_path(subscripts, *t_shapes, shapes=True)
             input, order = convert_path_to_ncon(subscripts, path)
-            if res is None:
+            if verbose > 2:
+                print(path_info)
+
+            if not checkpoint_move:
                 res = ncon(reduced_tmp, input, order=order)
             else:
-                res += ncon(reduced_tmp, input, order=order)
+                data_t, meta_t = _compress_ts(*reduced_tmp)
+                res_data, res_meta = checkpoint(_loop_body, meta_t, input, order, *data_t, use_reentrant=False)
+                res = decompress_from_1d(res_data, res_meta)
 
+            if tot is None:
+                tot = res
+            else:
+                tot += res
 
         except YastnError as e: # no consistent blocks found
             continue
+    return tot
+    # data_t, meta_t = _compress_ts(*reduced_ts)
+    # def _full_loop(meta_t, *data_t):
+    #     reduced_ts = _decompress_ts(data_t, meta_t)
+    #     tot = None
+    #     for charge_choice in product(*sliced_charge_list):
+    #         try:
+    #             # slice contracted legs
+    #             sliced_ts = list(reduced_ts)
+    #             for edge, charge in zip(sliced_edges, charge_choice):
+    #                 if len(edge) == 2:
+    #                     node0, node1 = edge
+    #                     sliced_ts[node0[0]] = _restrict_charges(sliced_ts[node0[0]], axes=node0[1], t=charge)
+    #                     sliced_ts[node1[0]] = _restrict_charges(sliced_ts[node1[0]], axes=node1[1], t=charge)
+    #                 else: # len(edge) == 1 open leg
+    #                     node = edge[0]
+    #                     sliced_ts[node[0]] = _restrict_charges(sliced_ts[node[0]], axes=node[1], t=charge)
 
-    return res
+    #             _, reduced_tmp = preprocess_contracted_dims(einsum_string, *sliced_ts)
+    #             sizes_dict = build_sizes_dict(subscripts, *reduced_tmp)
+    #             views = oe.helpers.build_views(subscripts, sizes_dict)
+    #             path, path_info = oe.contract_path(subscripts, *views)
+    #             input, order = convert_path_to_ncon(subscripts, path)
+    #             if verbose > 2:
+    #                 print(sizes_dict)
+    #                 print(path_info)
 
+    #             res = ncon(reduced_tmp, input, order=order)
 
-    # print(sliced_info)
-    # for t_pos in sliced_info:
+    #             if tot is None:
+    #                 tot = res
+    #             else:
+    #                 tot += res
 
+    #         except YastnError as e: # no consistent blocks found
+    #             continue
+    #     res_data, res_meta = tot.compress_to_1d()
+    #     return res_data, res_meta
 
+    # if checkpoint_move:
+    #     res_data, res_meta = checkpoint(_full_loop, meta_t, *data_t, use_reentrant=True)
+    # else:
+    #     res_data, res_meta = _full_loop(meta_t, *data_t)
+    # res = decompress_from_1d(res_data, res_meta)
+    # return res
 
-    # a_data, a_meta = a.compress_to_1d()
-    # b_data, b_meta = b.compress_to_1d()
-
-    # def _loop_fn(a_data, b_data):
-    #     tmp = None
-    #     a, b = decompress_from_1d(a_data, a_meta), decompress_from_1d(b_data, b_meta)
-    #     slice_leg = a.get_legs(axes=2)
-    #     for t, D in slice_leg.tD.items():
-    #         a_res = _restrict_charges(a, axes=2, t=t)
-    #         upper_half= b.flip_signature().tensordot(a_res, (1, 0))
-    #         b_res = _restrict_charges(b, axes=1, t=t)
-    #         lower_half = b_res.flip_signature().tensordot(a, (0, 2))
-    #         if tmp is None:
-    #             tmp = upper_half.tensordot(lower_half, ([0, 2], [1, 0]))
-    #         else:
-    #             tmp += upper_half.tensordot(lower_half, ([0, 2], [1, 0]))
-
-    #     tmp_data, tmp_meta = tmp.compress_to_1d()
-    #     return tmp_data, tmp_meta
-
-
-    # # use_reentrant = True is important here
-    # tmp_data, tmp_meta = checkpoint(_loop_fn, a_data, b_data, use_reentrant=True)
-    # rho = decompress_from_1d(tmp_data, tmp_meta).unfuse_legs(axes=(0, 1))
-    # return rho.trace(axes=((0, 2), (1, 3))).to_number()
 
 if __name__ == "__main__":
     config_U1 = yastn.make_config(sym='U1', backend=backend)
 
     # test_case 1
     print("============================Test-Case-1==========================")
-    leg1 = yastn.Leg(config_U1, s=1, t=(-1, 0, 1, 2), D=(2, 3, 2, 4))
-    leg2 = yastn.Leg(config_U1, s=1, t=(-3, 0, 1, 2), D=(2, 3, 2, 4))
-    leg3 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(3, 2))
-    leg4 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(3, 2))
+    leg1 = yastn.Leg(config_U1, s=1, t=(-1, 0, 1, 2), D=(2, 30, 20, 4))
+    leg2 = yastn.Leg(config_U1, s=1, t=(-3, 0, 1, 2), D=(2, 30, 20, 4))
+    leg3 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(30, 20))
+    leg4 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(30, 20))
 
     a = yastn.rand(config=config_U1, legs=[leg1, leg1.conj()])
     b = yastn.rand(config=config_U1, legs=[leg2, leg2.conj()])
@@ -178,41 +208,166 @@ if __name__ == "__main__":
     d = yastn.rand(config=config_U1, legs=[leg4, leg4.conj()])
 
     ts = (a, b, c, d)
-    einsum_string = "ab,bc,cd,de->ae"
-    # G, reduced_ts = preprocess_contracted_dims(einsum_string, *ts)
-    res = sliced_einsum(einsum_string, *ts, sliced=["a", "b", "d", "e"], checkpoint=False)
-    assert yastn.allclose(einsum(einsum_string, *ts), res)
+    for t in ts:
+        t._data.requires_grad = True
+
+    einsum_string = "ab,bc,cd,da->"
+    # res = sliced_einsum(einsum_string, *ts, sliced=["a", "b", "d", "e"], checkpoint_move=True)
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        profile_memory=True,
+        record_shapes=True) as prof:
+        res = sliced_einsum(einsum_string, *ts, sliced="b", checkpoint_move=True)
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Forward [checkpoint]: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+            record_shapes=True) as prof:
+        res._data.sum().backward()
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Backward [checkpoint]: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+    assert yastn.allclose(einsum(einsum_string, *ts), res, atol=1e-9)
+
+    ts = (a, b, c, d)
+    for t in ts:
+        t._data.grad.data.zero_()
+        t._data.requires_grad = True
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        profile_memory=True,
+        record_shapes=True) as prof:
+        res = sliced_einsum(einsum_string, *ts, sliced="b", checkpoint_move=False)
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Forward YASTN_EINSUM: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+            record_shapes=True) as prof:
+        res._data.sum().backward()
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Backward YASTN_EINSUM: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
 
     # test_case 2
     print("============================Test-Case-2==========================")
-    leg1 = yastn.Leg(config_U1, s=1, t=(-1, 0, 1, 2), D=(2, 3, 2, 4))
-    leg2 = yastn.Leg(config_U1, s=1, t=(-3, 0, 1, 2), D=(2, 3, 2, 4))
-    leg3 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(3, 2))
-    leg4 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(3, 2))
+    leg1 = yastn.Leg(config_U1, s=1, t=(-1, 0, 1, 2), D=(20, 30, 20, 40))
+    leg2 = yastn.Leg(config_U1, s=1, t=(-3, 0, 1, 2), D=(20, 30, 20, 40))
+    leg3 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(30, 20))
+    leg4 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(30, 20))
 
     a = yastn.rand(config=config_U1, legs=[leg1, leg1, leg1.conj()])
     b = yastn.rand(config=config_U1, legs=[leg1.conj(), leg1, leg2.conj()])
     c = yastn.rand(config=config_U1, legs=[leg3, leg3.conj()])
 
     ts = (a, b, c)
-    einsum_string = "abc,bcd,de->ae"
+    for t in ts:
+        t._data.requires_grad = True
+    einsum_string = "abc,bcd,da->"
     # G, reduced_ts = preprocess_contracted_dims(einsum_string, *ts)
-    res = sliced_einsum(einsum_string, *ts, sliced=["a", "b", "c", "e"], checkpoint=False)
-    assert yastn.allclose(einsum(einsum_string, *ts), res)
+    # res = sliced_einsum(einsum_string, *ts, sliced=["a", "b", "c", "e"], checkpoint_move=True)
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        profile_memory=True,
+        record_shapes=True) as prof:
+        res = sliced_einsum(einsum_string, *ts, sliced="b", checkpoint_move=True)
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Forward [checkpoint]: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+            record_shapes=True) as prof:
+        res.to_number().backward()
+
+    print(b._data.grad.numpy().sum())
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Backward [checkpoint]: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+    assert yastn.allclose(einsum(einsum_string, *ts), res, atol=1e-9)
+
+    for t in ts:
+        t._data.grad.data.zero_()
+        t._data.requires_grad = True
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        profile_memory=True,
+        record_shapes=True) as prof:
+        res = sliced_einsum(einsum_string, *ts, sliced="b", checkpoint_move=False)
+        # res = einsum(einsum_string, *ts)
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Forward YASTN_EINSUM: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+            record_shapes=True) as prof:
+        res._data.sum().backward()
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Backward YASTN_EINSUM: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+
 
     # test_case 3
     print("============================Test-Case-3==========================")
-    leg1 = yastn.Leg(config_U1, s=1, t=(-1, 0, 1, 2), D=(2, 3, 2, 4))
-    leg2 = yastn.Leg(config_U1, s=1, t=(-3, 0, 1, 2), D=(2, 3, 2, 4))
-    leg3 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(3, 2))
-    leg4 = yastn.Leg(config_U1, s=1, t=(0, 1), D=(3, 2))
+    leg1 = yastn.Leg(config_U1, s=1, t=(-1, 0, 1), D=(5, 10, 5))
+    leg2 = yastn.Leg(config_U1, s=1, t=(-4, -3, -2, -1, 0, 1, 2, 3, 4), D=(50, 50, 30, 30, 40, 30, 30, 50, 50))
 
-    a = yastn.rand(config=config_U1, legs=[leg1, leg1, leg1.conj()])
-    b = yastn.rand(config=config_U1, legs=[leg1.conj(), leg1, leg2.conj()])
-    c = yastn.rand(config=config_U1, legs=[leg3, leg3.conj()])
+    a = yastn.rand(config=config_U1, legs=[leg2, leg1, leg1.conj(), leg2])
+    b = yastn.ones(config=config_U1, legs=[leg2, leg2])
 
-    ts = (a, b, c)
-    einsum_string = "abb,ccd,de->ae"
-    # G, reduced_ts = preprocess_contracted_dims(einsum_string, *ts)
-    res = sliced_einsum(einsum_string, *ts, sliced=["a", "b", "c", "e"], checkpoint=False)
-    assert yastn.allclose(einsum(einsum_string, *ts), res)
+    ts = (b.flip_signature(), a, b.flip_signature(), a)
+    for t in ts:
+        t._data.requires_grad = True
+
+    einsum_string = "fg,gaad,ed,fbbe->"
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        profile_memory=True,
+        record_shapes=True) as prof:
+        res = sliced_einsum(einsum_string, *ts, sliced="f", checkpoint_move=True)
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Forward: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+            record_shapes=True) as prof:
+        res._data.sum().backward()
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Backward: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+
+    assert yastn.allclose(einsum(einsum_string, *ts), res, atol=1e-9)
+
+    for t in ts:
+        t._data.grad.data.zero_()
+        t._data.requires_grad = True
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        profile_memory=True,
+        record_shapes=True) as prof:
+        res = sliced_einsum(einsum_string, *ts, sliced="f", checkpoint_move=False)
+        # res = einsum(einsum_string, *ts)
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Forward YASTN_EINSUM: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
+
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+            record_shapes=True) as prof:
+        res._data.sum().backward()
+
+    peak_cpu = max(e.cpu_memory_usage for e in prof.events())
+    print(f"Backward YASTN_EINSUM: Peak CPU memory usage: {peak_cpu / 1024:.2f} kB")
